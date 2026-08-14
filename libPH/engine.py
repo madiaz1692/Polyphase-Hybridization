@@ -17,43 +17,38 @@ WEIGHTS_DIR = os.path.join(current_dir, "weights")
 def get_dll_path():
     sys_name = platform.system().lower()
     machine = platform.machine().lower()
-
+    
     if sys_name == "windows":
         return os.path.join(CORE_DIR, "libph_x86.dll")
-    
-    # Manual override for testing
-    if os.environ.get("PH_FORCE_AVX2") == "1":
-        return os.path.join(CORE_DIR, "libph_x86.so")
     
     # Linux / ARM support
     if "aarch64" in machine or "arm64" in machine:
         return os.path.join(CORE_DIR, "libph_sve.so")
     else:
-        # Check for AVX-512 specialized binary
-        avx512_path = os.path.join(CORE_DIR, "libph_avx512.so")
-        if os.path.exists(avx512_path):
-            return avx512_path
         # Default to x86_64 AVX2 on Linux
         return os.path.join(CORE_DIR, "libph_x86.so")
 
 DLL_PATH = get_dll_path()
 
 # -- Anchor Selection Logic --
+ANCHOR_POOL = [
+    (11, 1), (7, 1), (6, 1), (5, 1), (7, 2), 
+    (5, 2), (7, 3), (5, 3), (4, 3), (5, 4), (8, 7)
+]
+
 def find_anchor(target_angle_deg):
-    """Finds the best Farey anchor for the target angle (25 <= A <= 50)."""
-    best_anchor = (5, 0)
+    """Finds the best Farey anchor for the target angle from the optimized 11-anchor pool (25 <= A <= 60 plus boundary guards)."""
+    best_anchor = ANCHOR_POOL[0]
     min_diff = float('inf')
     target_rad = abs(math.radians(target_angle_deg))
-    for x in range(1, 13):
-        for y in range(0, 13):
-            if math.gcd(x, y) == 1:
-                A = x*x + y*y
-                if A < 25 or A > 50: continue
-                angle = math.atan2(y, x)
-                diff = abs(angle - target_rad)
-                if diff < min_diff:
-                    min_diff = diff
-                    best_anchor = (x, y)
+    
+    for p, q in ANCHOR_POOL:
+        angle = math.atan2(q, p)
+        diff = abs(angle - target_rad)
+        if diff < min_diff:
+            min_diff = diff
+            best_anchor = (p, q)
+            
     res_xr, res_yr = best_anchor
     if target_angle_deg < 0: res_yr = -res_yr
     return (res_xr, res_yr), math.degrees(math.atan2(res_yr, res_xr))
@@ -119,13 +114,11 @@ class PHProcessor:
         else: base = "ph_rotate_fast"
         
         if self.lib:
-            # Try base name, then platform-specific suffixes
-            for name in [base, f"{base}_avx512", f"{base}_avx2", f"{base}_sve"]:
-                func = getattr(self.lib, name, None)
-                if func:
-                    func.argtypes = self.common_argtypes
-                    func.restype = None
-                    return func
+            func = getattr(self.lib, base, None)
+            if func:
+                func.argtypes = self.common_argtypes
+                func.restype = None
+                return func
         
         raise AttributeError(f"Kernel {base} not found. Ensure the optimized binary is in 'core/'.")
 

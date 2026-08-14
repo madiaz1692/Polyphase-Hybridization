@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-table_V_iterative.py -- Iterative Robustness Suite with Visual Stacking)
-Ref: Polyphase Hybridization, Table V
-Benchmarks 90 and 360 1-degree-step cumulative rotation.
-Isolates quantization error using float32/uint8 comparison.
+table_V_iterative.py -- Iterative Robustness Suite across Dual Angular Regimes
+Ref: Polyphase Hybridization (Array Journal), Table 5
+Benchmarks two complementary regimes:
+  1. Fine Micro-Step Regime: 360 consecutive 1.0° steps (evaluating Step 90 and Step 360).
+  2. Anchor-Aligned Regime: 72 consecutive 5.0° steps (evaluating Step 18 [90°] and Step 72 [360°]).
 """
 
 import cv2
@@ -13,6 +14,7 @@ import sys
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
 from skimage import data
+from scipy.ndimage import rotate as scipy_rotate
 
 # Ensure we can import libPH
 try:
@@ -27,11 +29,11 @@ except ImportError:
     import libPH.engine as ph
 
 # --- Configuration ---
-SAVE_DEBUG_IMGS = False # Set to True to enable per-step/per-angle image exports
+SAVE_DEBUG_IMGS = False
 DEBUG_DIR = "debug_iterative"
 
 def add_visual_flag(img, text):
-    """Draws a professional label box in the corner of the image."""
+    """Draws a label box in the corner of the image."""
     res = img.copy()
     if res.ndim == 2:
         res = cv2.cvtColor(res, cv2.COLOR_GRAY2BGR)
@@ -49,7 +51,7 @@ if SAVE_DEBUG_IMGS:
     os.makedirs(DEBUG_DIR, exist_ok=True)
 
 def compute_metrics(orig, target):
-    # Same ROI protocol as engine regression
+    # Central 512x512 ROI evaluation on 800x800 canvas
     pad = (orig.shape[0] - 512) // 2
     o = orig[pad:-pad, pad:-pad]
     t = target[pad:-pad, pad:-pad]
@@ -63,77 +65,78 @@ def compute_metrics(orig, target):
     s_val = float(ssim(o, t, data_range=255))
     return p_val, s_val
 
-def run_iterative_test():
-    img = data.camera()
-    # 800x800 Safe Canvas via Reflection
-    pad = 144
-    img_800 = cv2.copyMakeBorder(img, pad, pad, pad, pad, cv2.BORDER_REFLECT)
-    
-    print("=" * 115)
-    print(f"{' PH: TABLE V - ITERATIVE ROBUSTNESS SUITE ':^115}")
-    print(f"{' (90 1.0 deg steps | Canvas: 800x800 | ROI: 512x512) ':^115}")
-    print("=" * 115)
-
-    from scipy.ndimage import rotate as scipy_rotate
-    
-    # Rotator registry (Method Name, Dtype, Func)
+def run_regime(img_800, step_deg, total_steps, milestone_steps):
     methods = [
-        ('CV2 Bilinear', lambda i, a: cv2.warpAffine(i, cv2.getRotationMatrix2D((i.shape[1]/2.0-0.5, i.shape[0]/2.0-0.5), a, 1.0), (i.shape[1], i.shape[0]), flags=cv2.INTER_LINEAR)),
-        ('CV2 Cubic', lambda i, a: cv2.warpAffine(i, cv2.getRotationMatrix2D((i.shape[1]/2.0-0.5, i.shape[0]/2.0-0.5), a, 1.0), (i.shape[1], i.shape[0]), flags=cv2.INTER_CUBIC)),
+        ('OpenCV Cubic', lambda i, a: cv2.warpAffine(i, cv2.getRotationMatrix2D((i.shape[1]/2.0-0.5, i.shape[0]/2.0-0.5), a, 1.0), (i.shape[1], i.shape[0]), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT_101)),
+        ('PH-Fast (4x4)', lambda i, a: ph.rotate(i, a, mode='fast', beta=3, reshape=False, return_uint8=True)),
         ('SciPy Spline-3', lambda i, a: scipy_rotate(i, a, reshape=False, order=3, mode='reflect', prefilter=True)),
+        ('PH-HQ (8x8)', lambda i, a: ph.rotate(i, a, mode='hq', beta=5, reshape=False, return_uint8=True)),
         ('SciPy Spline-5', lambda i, a: scipy_rotate(i, a, reshape=False, order=5, mode='reflect', prefilter=True)),
-        ('PH-Fast (4x4)', lambda i, a: ph.rotate(i, a, mode='fast', beta=3, return_uint8=True)),
-        ('PH-HQ (8x8)', lambda i, a: ph.rotate(i, a, mode='hq',   beta=5, return_uint8=True)),
-        ('PH-SHQ (12x12)', lambda i, a: ph.rotate(i, a, mode='shq',  beta=7, return_uint8=True)),
+        ('PH-SHQ (12x12)', lambda i, a: ph.rotate(i, a, mode='shq', beta=7, reshape=False, return_uint8=True)),
     ]
 
-    # Persistent states for iterative simulation
     states = []
     for m_name, func in methods:
         init_img = img_800.copy().astype(np.uint8)
         states.append({'name': m_name, 'func': func, 'curr': init_img, 'results': {}})
 
-    milestones = [90, 360]
-    debug_milestones = list(range(15, 361, 15))
-
-    for step in range(1, 361):
+    for step in range(1, total_steps + 1):
+        cum_angle = step * step_deg
         for s in states:
-            s['curr'] = s['func'](s['curr'], 1.0) # Accumulate 1 degree
+            s['curr'] = s['func'](s['curr'], step_deg)
             
-            if step in milestones:
-                # Select correct reference
-                if step == 90:
-                    ref = np.rot90(img_800, k=1)
-                else: # 360
+            if step in milestone_steps:
+                # Reference: exact np.rot90 for 90/180/270/360 or single-pass ground truth
+                if int(round(cum_angle)) % 360 == 0:
                     ref = img_800
+                elif int(round(cum_angle)) == 90:
+                    ref = np.rot90(img_800, k=1)
+                else:
+                    ref = scipy_rotate(img_800, cum_angle, reshape=False, order=5, mode='reflect', prefilter=True)
+                
                 p, ss = compute_metrics(ref, s['curr'])
                 s['results'][step] = (p, ss)
-        
-        # Periodic visual stacking for visualization
-        if SAVE_DEBUG_IMGS and step in debug_milestones:
-            strips = []
-            for s in states:
-                # Convert to u8 for saving
-                img_to_save = s['curr']
-                if img_to_save.dtype != np.uint8:
-                    img_to_save = np.clip(img_to_save, 0, 255).astype(np.uint8)
-                # Crop ROI 512
-                roi = img_to_save[pad:-pad, pad:-pad]
-                # Label
-                label = f"{s['name']}"
-                strips.append(add_visual_flag(roi, label))
-            
-            full_strip = np.hstack(strips)
-            cv2.imwrite(os.path.join(DEBUG_DIR, f"stack_all_step_{step}.png"), full_strip)
 
-    print(f"{'Method':<20} | {'90deg (PSNR/SSIM)':^18} | {'360deg (PSNR/SSIM)':^18}")
-    print("-" * 70)
-    for s in states:
-        m90 = s['results'].get(90, (0, 0))
-        m360 = s['results'].get(360, (0, 0))
-        print(f"{s['name']:<20} | {m90[0]:>6.2f} / {m90[1]:>5.3f} | {m360[0]:>6.2f} / {m360[1]:>5.3f}")
+    return {s['name']: s['results'] for s in states}
 
-    print("-" * 70)
+def run_iterative_test():
+    img = data.camera()
+    pad = 144
+    img_800 = cv2.copyMakeBorder(img, pad, pad, pad, pad, cv2.BORDER_REFLECT)
+
+    print("=" * 125)
+    print(f"{' PH: TABLE 5 - ITERATIVE ROBUSTNESS SUITE (DUAL-REGIME EVALUATION) ':^125}")
+    print(f"{' (1.0 deg Micro-Steps vs 5.0 deg Anchor-Aligned Orbit | Canvas: 800x800 | ROI: 512x512) ':^125}")
+    print("=" * 125)
+
+    print("Running Regime 1: Fine Micro-Steps (DeltaTheta = 1.0 deg, 360 steps)...")
+    res_1deg = run_regime(img_800, step_deg=1.0, total_steps=360, milestone_steps=[90, 360])
+
+    print("Running Regime 2: Anchor-Aligned Steps (DeltaTheta = 5.0 deg, 72 steps)...")
+    res_5deg = run_regime(img_800, step_deg=5.0, total_steps=72, milestone_steps=[18, 72])
+
+    print("\n" + "=" * 125)
+    print(f"{'':<18} | {'Fine Micro-Step Regime (DeltaTheta = 1.0 deg)':^48} | {'Anchor-Aligned Regime (DeltaTheta = 5.0 deg)':^48}")
+    print(f"{'Method':<18} | {'Step 90 (90deg)':^22} | {'Step 360 (360deg)':^23} | {'Step 18 (90deg)':^22} | {'Step 72 (360deg)':^23}")
+    print(f"{'':<18} | {'PSNR (dB) / SSIM':^22} | {'PSNR (dB) / SSIM':^23} | {'PSNR (dB) / SSIM':^22} | {'PSNR (dB) / SSIM':^23}")
+    print("-" * 125)
+
+    method_names = ['OpenCV Cubic', 'PH-Fast (4x4)', 'SciPy Spline-3', 'PH-HQ (8x8)', 'SciPy Spline-5', 'PH-SHQ (12x12)']
+
+    for name in method_names:
+        r1_90 = res_1deg[name].get(90, (0.0, 0.0))
+        r1_360 = res_1deg[name].get(360, (0.0, 0.0))
+        r5_18 = res_5deg[name].get(18, (0.0, 0.0))
+        r5_72 = res_5deg[name].get(72, (0.0, 0.0))
+
+        str_r1_90 = f"{r1_90[0]:>5.2f} / {r1_90[1]:.3f}"
+        str_r1_360 = f"{r1_360[0]:>5.2f} / {r1_360[1]:.3f}"
+        str_r5_18 = f"{r5_18[0]:>5.2f} / {r5_18[1]:.3f}"
+        str_r5_72 = f"{r5_72[0]:>5.2f} / {r5_72[1]:.3f}"
+
+        print(f"{name:<18} | {str_r1_90:^22} | {str_r1_360:^23} | {str_r5_18:^22} | {str_r5_72:^23}")
+
+    print("=" * 125)
 
 if __name__ == "__main__":
     run_iterative_test()
